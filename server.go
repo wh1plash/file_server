@@ -1,9 +1,10 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"github.com/getlantern/systray"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"gopkg.in/ini.v1"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "github.com/lib/pq" // Импортируем драйвер PostgreSQL
 )
 
 var (
@@ -40,10 +43,14 @@ var (
 	password  string
 	logDir    string
 	logFile   string
+
+	db        *sql.DB // Глобальная переменная для базы данных
+	sessionID int     // Переменная для хранения текущего session_id
 )
 
 // Statistics Структура для хранения статистики
 type Statistics struct {
+	SessionID            int       `json:"session_id"`
 	TotalFilesReceived   int       `json:"total_files_received"`
 	CountAllowedFiles    int       `json:"count_allowed_files"`
 	CountUnknownFiles    int       `json:"count_unknown_files"`
@@ -58,7 +65,7 @@ func init() {
 	var err error
 	cfg, err := ini.Load("config.ini")
 	if err != nil {
-		log.Error().Err(errors.New("Ошибка при загрузке файла config.ini: "))
+		log.Error().Msg(fmt.Sprintf("Error loading file %s:  %s", cfg, err))
 	}
 
 	useHTTPS, _ = cfg.Section("Server").Key("UseHTTPS").Bool()
@@ -89,6 +96,71 @@ func init() {
 		if err != nil {
 			return
 		}
+	}
+
+	//db, err = sql.Open("sqlite3", "./sqlite/statistics.db")
+	//if err != nil {
+	//	log.Error().Msg(fmt.Sprintf("Ошибка БД>: %v", err))
+	//}
+
+	// Подключение к базе данных PostgreSQL
+	connStr := "host=localhost user=postgres password=postgres dbname=statistics sslmode=disable" // Замените на ваши данные подключения
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Error().Msg(fmt.Sprintf("Error connecting to PostgreSQL database: %s", err))
+	}
+
+	// Создаем таблицу для хранения статистики, если она не существует
+	createTableSQL := `CREATE TABLE IF NOT EXISTS statistics (
+        session_id SERIAL PRIMARY KEY,
+        total_files_received INTEGER,
+        count_allowed_files INTEGER,
+        count_unknown_files INTEGER,
+        last_file_received_name TEXT,
+        total_mbytes_received REAL,
+        last_file_received_time TIMESTAMP
+    );`
+
+	if _, err := db.Exec(createTableSQL); err != nil {
+		log.Error().Msg(fmt.Sprintf("Error creating table: %v", err))
+	}
+	recordNewStatistics()
+}
+
+// Создание новой записи с новым session_id и нулевыми значениями статистики
+func recordNewStatistics() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Создаем новую запись в таблице statistics с нулевыми значениями
+	insertSQL := `INSERT INTO statistics (total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time) 
+				  VALUES (0, 0, 0, '', 0.0, now()) RETURNING session_id`
+
+	err := db.QueryRow(insertSQL).Scan(&sessionID)
+	if err != nil {
+		log.Error().Msg(fmt.Sprintf("Error writing initial statistics: %v", err))
+	}
+}
+
+// Запись статистики в базу данных
+func updateStatistics() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Обновляем существующую запись в таблице statistics с текущими значениями статистики
+	updateSQL := `UPDATE statistics 
+				  SET total_files_received = $1,
+					  count_allowed_files = $2,
+					  count_unknown_files = $3,
+					  last_file_received_name = $4,
+					  total_mbytes_received = $5,
+					  last_file_received_time = $6 
+				  WHERE session_id = $7`
+
+	_, err := db.Exec(updateSQL, totalFilesReceived, CountAllowedFiles, CountUnknownFiles, lastFileReceivedName, float64(totalBytesReceived)/(1024*1024), lastFileReceivedTime, sessionID)
+
+	if err != nil {
+		log.Error().Msg(fmt.Sprintf("Error updating statistics: %v", err))
 	}
 }
 
@@ -121,6 +193,12 @@ func createConfigIfNotExists() {
 }
 
 func main() {
+	defer func(db *sql.DB) {
+		err := db.Close()
+		if err != nil {
+			log.Error().Msg(fmt.Sprintf("Error closing database: %s", err))
+		}
+	}(db) // Закрываем базу данных при завершении
 	createDirectories()
 
 	// Настройка ротации логов
@@ -138,15 +216,22 @@ func main() {
 
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
-	log.Info().Msg("Приложение запущено")
+	log.Info().Msg("The application has been launched")
 
-	log.Info().Msg("Запуск сервера приема файлов...")
+	go func() {
+		systray.Run(onReady, onExit)
+		log.Info().Msg("The server has terminated.")
+		os.Exit(0)
+	}()
+
+	log.Info().Msg("Starting file receiving server...")
+	http.HandleFunc("/", serveIndex) // Главная страница
 	http.HandleFunc("/upload", basicAuth(uploadHandler))
 	http.HandleFunc("/api/statistics", getStatistics) // Добавляем новый маршрут
 
 	// Запись в лог при завершении программы
 	exitHandler := func() {
-		log.Info().Msg("Завершение программы приема файлов...")
+		log.Info().Msg("Terminating file receiving program...")
 		os.Exit(0)
 	}
 	c := make(chan os.Signal, 1)
@@ -158,19 +243,61 @@ func main() {
 
 	if useHTTPS {
 		addr := fmt.Sprintf("%s:%s", host, httpsport)
-		log.Info().Msg(fmt.Sprintf("Запуск HTTPS сервера на %s\n", addr))
+		log.Info().Msg(fmt.Sprintf("Launching HTTPS server on %s", addr))
 		err := http.ListenAndServeTLS(addr, certFile, keyFile, nil)
 		if err != nil {
-			log.Error().Msg("Ошибка запуска HTTPS сервера: ")
+			log.Error().Msg("HTTPS server startup error: ")
 		}
 	} else {
 		addr := fmt.Sprintf("%s:%s", host, port)
-		log.Info().Msg(fmt.Sprintf("Запуск HTTP сервера на %s\n", addr))
+		log.Info().Msg(fmt.Sprintf("Launching HTTPS server on %s", addr))
 		err := http.ListenAndServe(addr, nil)
 		if err != nil {
-			log.Error().Msg("Ошибка запуска HTTP сервера: ")
+			log.Error().Msg("HTTP server startup error: ")
 		}
 	}
+}
+
+func onReady() {
+	// Загрузка иконки из файла
+	iconFile, err := os.Open("icon.ico") // Убедитесь, что файл существует
+	if err != nil {
+		log.Error().Msg(fmt.Sprintf("Error opening icon file: %s", err))
+	}
+	defer func() {
+		if err := iconFile.Close(); err != nil {
+			log.Error().Msg(fmt.Sprintf("Error closing icon file: %s", err))
+		}
+	}()
+
+	// Чтение файла в байты
+	iconBytes, err := io.ReadAll(iconFile)
+	if err != nil {
+		log.Error().Msg(fmt.Sprintf("Error on read icon file: %s", err))
+	}
+
+	// Установка иконки и создание меню
+	systray.SetIcon(iconBytes)
+	systray.SetTitle("Server")
+	systray.SetTooltip("Server control")
+
+	mQuit := systray.AddMenuItem("Exit", "Terminate application")
+
+	go func() {
+		for {
+			<-mQuit.ClickedCh
+			systray.Quit()
+		}
+	}()
+}
+
+func onExit() {
+	log.Info().Msg("Завершение работы сервера...")
+}
+
+// Обработчик для отображения HTML-страницы
+func serveIndex(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "index.html")
 }
 
 func createDirectories() {
@@ -197,16 +324,16 @@ func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Проверка метода запроса
 	if r.Method != http.MethodPost {
-		http.Error(w, "Метод не разрешен", http.StatusMethodNotAllowed)
-		log.Warn().Msg(fmt.Sprintf("Получен запрос с неподдерживаемым методом: %s", r.Method))
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		log.Warn().Msg(fmt.Sprintf("A request with an unsupported method was received.: %s", r.Method))
 		return
 	}
 
 	// Получение файла из запроса
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "Ошибка получения файла: "+err.Error(), http.StatusBadRequest)
-		log.Error().Msg("Ошибка получения файла:")
+		http.Error(w, "Error receiving file: "+err.Error(), http.StatusBadRequest)
+		log.Error().Msg(fmt.Sprintf("Error receiving file: %s", err))
 		return
 	}
 	defer func(file multipart.File) {
@@ -224,8 +351,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Создаем папку, если она не существует
 	if err := os.MkdirAll(saveDir, os.ModePerm); err != nil {
-		http.Error(w, "Ошибка создания папки: "+err.Error(), http.StatusInternalServerError)
-		log.Error().Msg("Ошибка создания папки:")
+		http.Error(w, "Error creating folder: "+err.Error(), http.StatusInternalServerError)
+		log.Error().Msg(fmt.Sprintf("Error creating folder: %s", err))
 		return
 	}
 
@@ -246,24 +373,24 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Создаем файл на сервере
 	dst, err := os.Create(newFilename)
 	if err != nil {
-		http.Error(w, "Ошибка создания файла на сервере: "+err.Error(), http.StatusInternalServerError)
-		log.Error().Msg("Ошибка создания файла:")
+		http.Error(w, "Error creating file on server: "+err.Error(), http.StatusInternalServerError)
+		log.Error().Msg(fmt.Sprintf("ОError creating file on server: %s", err))
 		return
 	}
 
 	// Копируем содержимое загруженного файла в новый файл на сервере
 	_, err = io.Copy(dst, file)
 	if err != nil {
-		http.Error(w, "Ошибка копирования файла: "+err.Error(), http.StatusInternalServerError)
-		log.Error().Msg("Ошибка копирования файла:")
+		http.Error(w, "File copy error: "+err.Error(), http.StatusInternalServerError)
+		log.Error().Msg(fmt.Sprintf("File copy error: %s", err))
 		return
 	}
 
 	// Получаем информацию о загруженном файле
 	fileInfo, err := os.Stat(dst.Name())
 	if err != nil {
-		http.Error(w, "Ошибка получения информации о файле: "+err.Error(), http.StatusInternalServerError)
-		log.Error().Msg("Ошибка получения информации о файле:")
+		http.Error(w, "Error getting file information: "+err.Error(), http.StatusInternalServerError)
+		log.Error().Msg(fmt.Sprintf("Ошибка получения информации о файле: %s", err))
 		return
 	}
 
@@ -280,10 +407,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Unlock()
 
+	updateStatistics() // Обновляем статистику в базе данных
 	totalBytesReceivedMB := float64(totalBytesReceived) / (1024 * 1024)
 
-	log.Info().Msg(fmt.Sprintf("Файл успешно загружен: %s", lastFileReceivedName))
-	fmt.Printf("Файл успешно загружен: %s | Количество принятых файлов: %d | Общий объем: %.2f MB | Последний файл: %s в %s\n",
+	log.Info().Msg(fmt.Sprintf("File uploaded successfully: %s", lastFileReceivedName))
+	fmt.Printf("File uploaded successfully: %s | total_files_received: %d | total_megabyte_received: %.2f MB | last_file_name: %s в %s\n",
 		lastFileReceivedName, totalFilesReceived, totalBytesReceivedMB, lastFileReceivedName, lastFileReceivedTime.Format(time.RFC3339))
 
 	w.WriteHeader(http.StatusOK)
@@ -293,24 +421,27 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 // Обработчик для получения статистики
 func getStatistics(w http.ResponseWriter, _ *http.Request) {
 	mu.Lock()
-	defer mu.Unlock()
 
-	totalBytesReceivedMB := float64(totalBytesReceived) / (1024 * 1024)
+	// Извлекаем последнюю запись из таблицы statistics
+	var stats Statistics
+	row := db.QueryRow("SELECT session_id, total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time FROM statistics ORDER BY session_id DESC LIMIT 1")
 
-	stats := Statistics{
-		TotalFilesReceived:   totalFilesReceived,
-		CountAllowedFiles:    CountAllowedFiles,
-		CountUnknownFiles:    CountUnknownFiles,
-		LastFileReceivedName: lastFileReceivedName,
-		TotalMBytesReceived:  totalBytesReceivedMB,
-		LastFileReceivedTime: lastFileReceivedTime,
+	if err := row.Scan(&stats.SessionID, &stats.TotalFilesReceived, &stats.CountAllowedFiles, &stats.CountUnknownFiles, &stats.LastFileReceivedName, &stats.TotalMBytesReceived, &stats.LastFileReceivedTime); err != nil {
+		log.Error().Msg(fmt.Sprintf("Error extracting statistics: %v", err))
+		http.Error(w, "Error extracting statistics", http.StatusInternalServerError)
+		return
 	}
 
-	log.Info().Msg(fmt.Sprintf("Statistics: %+v", stats)) // Отладочное сообщение
+	mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(stats)
-	if err != nil {
+
+	log.Info().Msg(fmt.Sprintf("Statistics: %+v\n", stats))
+
+	// Кодируем структуру в JSON и отправляем ответ
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Error().Msg(fmt.Sprintf("JSON encoding error: %v", err))
+		http.Error(w, "JSON encoding error", http.StatusInternalServerError)
 		return
 	}
 }
