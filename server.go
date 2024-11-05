@@ -166,7 +166,7 @@ func updateStatistics() {
 
 func createConfigIfNotExists() {
 	if _, err := os.Stat("config.ini"); os.IsNotExist(err) {
-		log.Info().Msg("Файл config.ini не найден. Создаем новый файл конфигурации.")
+		log.Info().Msg("File config.ini not found. Create new configuration file.")
 
 		cfg := ini.Empty()
 
@@ -185,10 +185,10 @@ func createConfigIfNotExists() {
 
 		err := cfg.SaveTo("config.ini")
 		if err != nil {
-			log.Error().Msg("Ошибка при создании файла config.ini: ")
+			log.Error().Msg("Error creating config.ini file: ")
 		}
 
-		log.Info().Msg("Файл config.ini успешно создан с настройками по умолчанию.")
+		log.Info().Msg("The config.ini file has been successfully created with default settings.")
 	}
 }
 
@@ -390,7 +390,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	fileInfo, err := os.Stat(dst.Name())
 	if err != nil {
 		http.Error(w, "Error getting file information: "+err.Error(), http.StatusInternalServerError)
-		log.Error().Msg(fmt.Sprintf("Ошибка получения информации о файле: %s", err))
+		log.Error().Msg(fmt.Sprintf("Error getting file information: %s", err))
 		return
 	}
 
@@ -411,7 +411,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	totalBytesReceivedMB := float64(totalBytesReceived) / (1024 * 1024)
 
 	log.Info().Msg(fmt.Sprintf("File uploaded successfully: %s", lastFileReceivedName))
-	fmt.Printf("File uploaded successfully: %s | total_files_received: %d | total_megabyte_received: %.2f MB | last_file_name: %s в %s\n",
+	fmt.Printf("File uploaded successfully: %s | total files received: %d | total megabyte received: %.2f MB | last file name: %s в %s\n",
 		lastFileReceivedName, totalFilesReceived, totalBytesReceivedMB, lastFileReceivedName, lastFileReceivedTime.Format(time.RFC3339))
 
 	w.WriteHeader(http.StatusOK)
