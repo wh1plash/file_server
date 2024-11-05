@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Server control</title>
+</head>
+<body>
+    <h1>Server control</h1>
+    <button onclick="getStatistics()">Get Statistics</button>
+    <div id="stats"></div>
+
+    <script>
+        function getStatistics() {
+            fetch('/api/statistics')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('stats').innerText = JSON.stringify(data, null, 2);
+                })
+                .catch(error => console.error('Ошибка:', error));
+        }
+    </script>
+</body>
+</html>

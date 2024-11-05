@@ -76,9 +76,9 @@ func init() {
 	if useHTTPS {
 		certFile = cfg.Section("Server").Key("CertFile").String()
 		keyFile = cfg.Section("Server").Key("KeyFile").String()
-		log.Info().Msg(fmt.Sprintf("Сервер настроен на HTTPS: %s:%s", host, httpsport))
+		log.Info().Msg(fmt.Sprintf("The server is configured for HTTPS: %s:%s", host, httpsport))
 	} else {
-		log.Info().Msg(fmt.Sprintf("Сервер настроен на HTTP. port: %s", port))
+		log.Info().Msg(fmt.Sprintf("The server is configured for HTTP. port: %s", port))
 	}
 
 	uploadDir = cfg.Section("Server").Key("UploadDir").String()
@@ -250,7 +250,7 @@ func main() {
 		}
 	} else {
 		addr := fmt.Sprintf("%s:%s", host, port)
-		log.Info().Msg(fmt.Sprintf("Launching HTTPS server on %s", addr))
+		log.Info().Msg(fmt.Sprintf("Launching HTTP server on %s", addr))
 		err := http.ListenAndServe(addr, nil)
 		if err != nil {
 			log.Error().Msg("HTTP server startup error: ")
@@ -292,7 +292,7 @@ func onReady() {
 }
 
 func onExit() {
-	log.Info().Msg("Завершение работы сервера...")
+	log.Info().Msg("Terminate application...")
 }
 
 // Обработчик для отображения HTML-страницы
