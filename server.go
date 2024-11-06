@@ -51,6 +51,8 @@ var (
 // Statistics Структура для хранения статистики
 type Statistics struct {
 	SessionID            int       `json:"session_id"`
+	SessionStart         time.Time `json:"session_start"`
+	SessionEnd           time.Time `json:"session_end"`
 	TotalFilesReceived   int       `json:"total_files_received"`
 	CountAllowedFiles    int       `json:"count_allowed_files"`
 	CountUnknownFiles    int       `json:"count_unknown_files"`
@@ -65,7 +67,7 @@ func init() {
 	var err error
 	cfg, err := ini.Load("config.ini")
 	if err != nil {
-		log.Error().Msg(fmt.Sprintf("Error loading file %s:  %s", cfg, err))
+		log.Error().Msg(fmt.Sprintf("Error loading file config.ini:  %s", err))
 	}
 
 	useHTTPS, _ = cfg.Section("Server").Key("UseHTTPS").Bool()
@@ -113,6 +115,8 @@ func init() {
 	// Создаем таблицу для хранения статистики, если она не существует
 	createTableSQL := `CREATE TABLE IF NOT EXISTS statistics (
         session_id SERIAL PRIMARY KEY,
+        session_start	TIMESTAMP,
+        session_end		TIMESTAMP,
         total_files_received INTEGER,
         count_allowed_files INTEGER,
         count_unknown_files INTEGER,
@@ -124,6 +128,7 @@ func init() {
 	if _, err := db.Exec(createTableSQL); err != nil {
 		log.Error().Msg(fmt.Sprintf("Error creating table: %v", err))
 	}
+	createDirectories()
 	recordNewStatistics()
 }
 
@@ -133,8 +138,8 @@ func recordNewStatistics() {
 	defer mu.Unlock()
 
 	// Создаем новую запись в таблице statistics с нулевыми значениями
-	insertSQL := `INSERT INTO statistics (total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time) 
-				  VALUES (0, 0, 0, '', 0.0, now()) RETURNING session_id`
+	insertSQL := `INSERT INTO statistics (session_start, total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time) 
+				  VALUES (now(), 0, 0, 0, '', 0.0, now()) RETURNING session_id`
 
 	err := db.QueryRow(insertSQL).Scan(&sessionID)
 	if err != nil {
@@ -161,6 +166,15 @@ func updateStatistics() {
 
 	if err != nil {
 		log.Error().Msg(fmt.Sprintf("Error updating statistics: %v", err))
+	}
+}
+
+func closeDB() {
+	setEndSession()                    // Устанавливаем время завершения сессии перед выходом из программы.
+	if err := db.Close(); err != nil { // Закрываем базу данных при завершении.
+		log.Error().Msg(fmt.Sprintf("Error closing database: %s", err))
+	} else {
+		log.Info().Msg("Disconnecting from database...")
 	}
 }
 
@@ -193,14 +207,6 @@ func createConfigIfNotExists() {
 }
 
 func main() {
-	defer func(db *sql.DB) {
-		err := db.Close()
-		if err != nil {
-			log.Error().Msg(fmt.Sprintf("Error closing database: %s", err))
-		}
-	}(db) // Закрываем базу данных при завершении
-	createDirectories()
-
 	// Настройка ротации логов
 	logFilePath := filepath.Join(logDir, logFile)
 	logWriter := &lumberjack.Logger{
@@ -216,29 +222,24 @@ func main() {
 
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
-	log.Info().Msg("The application has been launched")
-
-	go func() {
-		systray.Run(onReady, onExit)
-		log.Info().Msg("The server has terminated.")
-		os.Exit(0)
-	}()
-
 	log.Info().Msg("Starting file receiving server...")
 	http.HandleFunc("/", serveIndex) // Главная страница
 	http.HandleFunc("/upload", basicAuth(uploadHandler))
-	http.HandleFunc("/api/statistics", getStatistics) // Добавляем новый маршрут
+	http.HandleFunc("/api/statistics", getStatistics)            // маршрут для получения статистики
+	http.HandleFunc("/api/statistics/time", getStatisticsByTime) // маршрут для получения статистики по времени
 
-	// Запись в лог при завершении программы
-	exitHandler := func() {
-		log.Info().Msg("Terminating file receiving program...")
-		os.Exit(0)
-	}
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		<-c
-		exitHandler()
+		closeDB()
+		log.Info().Msg("Terminating file receiving program...")
+		os.Exit(0) // Завершение программы
+	}()
+
+	go func() {
+		systray.Run(onReady, onExit)
+		os.Exit(0)
 	}()
 
 	if useHTTPS {
@@ -255,6 +256,17 @@ func main() {
 		if err != nil {
 			log.Error().Msg("HTTP server startup error: ")
 		}
+	}
+}
+
+func setEndSession() {
+	updateSQL := `UPDATE statistics 
+					  SET session_end = now()
+					  WHERE session_id = $1`
+	_, err := db.Exec(updateSQL, sessionID)
+
+	if err != nil {
+		log.Error().Msg(fmt.Sprintf("Error updating statistics: %v", err))
 	}
 }
 
@@ -292,11 +304,13 @@ func onReady() {
 }
 
 func onExit() {
+	closeDB()
 	log.Info().Msg("Terminate application...")
 }
 
 // Обработчик для отображения HTML-страницы
 func serveIndex(w http.ResponseWriter, r *http.Request) {
+	//log.Info().Msg(fmt.Sprintf("msg: %s", msg)
 	http.ServeFile(w, r, "index.html")
 }
 
@@ -421,22 +435,56 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 // Обработчик для получения статистики
 func getStatistics(w http.ResponseWriter, _ *http.Request) {
 	mu.Lock()
+	defer mu.Unlock()
 
 	// Извлекаем последнюю запись из таблицы statistics
 	var stats Statistics
-	row := db.QueryRow("SELECT session_id, total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time FROM statistics ORDER BY session_id DESC LIMIT 1")
+	row := db.QueryRow("SELECT session_id, session_start, total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time FROM statistics ORDER BY session_id DESC LIMIT 1")
 
-	if err := row.Scan(&stats.SessionID, &stats.TotalFilesReceived, &stats.CountAllowedFiles, &stats.CountUnknownFiles, &stats.LastFileReceivedName, &stats.TotalMBytesReceived, &stats.LastFileReceivedTime); err != nil {
+	if err := row.Scan(&stats.SessionID, &stats.SessionStart, &stats.TotalFilesReceived, &stats.CountAllowedFiles, &stats.CountUnknownFiles, &stats.LastFileReceivedName, &stats.TotalMBytesReceived, &stats.LastFileReceivedTime); err != nil {
 		log.Error().Msg(fmt.Sprintf("Error extracting statistics: %v", err))
 		http.Error(w, "Error extracting statistics", http.StatusInternalServerError)
 		return
 	}
 
-	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+
+	log.Info().Msg(fmt.Sprintf("Statistics: %+v", stats))
+
+	// Кодируем структуру в JSON и отправляем ответ
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Error().Msg(fmt.Sprintf("JSON encoding error: %v", err))
+		http.Error(w, "JSON encoding error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// Обработчик для получения статистики по времени
+func getStatisticsByTime(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	date := r.URL.Query().Get("date")
+
+	// Параметры для запроса к базе данных
+	var stats Statistics
+
+	// Запрос к базе данных для получения статистики по дате
+	query := `SELECT session_id, session_start, session_end, total_files_received, count_allowed_files, count_unknown_files, last_file_received_name, total_mbytes_received, last_file_received_time 
+              FROM statistics WHERE date(last_file_received_time) = $1`
+
+	err := db.QueryRow(query, date).Scan(&stats.SessionID, &stats.SessionStart, &stats.SessionEnd, &stats.TotalFilesReceived, &stats.CountAllowedFiles, &stats.CountUnknownFiles,
+		&stats.LastFileReceivedName, &stats.TotalMBytesReceived, &stats.LastFileReceivedTime)
 
 	w.Header().Set("Content-Type", "application/json")
 
-	log.Info().Msg(fmt.Sprintf("Statistics: %+v\n", stats))
+	if err == sql.ErrNoRows {
+		json.NewEncoder(w).Encode(map[string]string{"message": "No data for the specified date"})
+		log.Error().Msg(fmt.Sprintf("Error extracting statistics: %v Date: %s", err, date))
+		return
+	}
+
+	log.Info().Msg(fmt.Sprintf("Statistics_by_time: %+v", stats))
 
 	// Кодируем структуру в JSON и отправляем ответ
 	if err := json.NewEncoder(w).Encode(stats); err != nil {
